@@ -1,0 +1,309 @@
+import requests
+from bs4 import BeautifulSoup
+import os
+import time
+from urllib.parse import urljoin, urlparse
+import random
+import re
+
+class WindowsSpotlightScraper:
+    def __init__(self, download_folder="spotlight_images"):
+        self.base_url = "https://windows10spotlight.com"
+        self.download_folder = download_folder
+        self.session = requests.Session()
+        
+        # Enhanced headers to appear more like a real browser
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        })
+        
+        # Create download folder if it doesn't exist
+        if not os.path.exists(download_folder):
+            os.makedirs(download_folder)
+    
+    def get_with_retry(self, url, max_retries=3):
+        """Make a request with retry logic and random delays"""
+        for attempt in range(max_retries):
+            try:
+                # Random delay between requests (1-3 seconds)
+                if attempt > 0:
+                    delay = random.uniform(2, 5)
+                    print(f"Retrying in {delay:.1f} seconds... (attempt {attempt + 1})")
+                    time.sleep(delay)
+                
+                response = self.session.get(url, timeout=15)
+                
+                if response.status_code == 403:
+                    print(f"403 Forbidden for {url} - attempt {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        # Try with different user agent
+                        user_agents = [
+                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+                            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                        ]
+                        self.session.headers['User-Agent'] = random.choice(user_agents)
+                        continue
+                
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                print(f"Request error for {url}: {e}")
+                if attempt == max_retries - 1:
+                    raise
+        
+        return None
+    
+    def check_site_accessibility(self):
+        """Test if the main site is accessible"""
+        try:
+            response = self.get_with_retry(self.base_url)
+            if response and response.status_code == 200:
+                print("Site is accessible")
+                return True
+            else:
+                print("Site may be blocking requests")
+                return False
+        except Exception as e:
+            print(f"Site accessibility test failed: {e}")
+            return False
+    
+    def get_image_url_from_detail_page(self, image_id):
+        """Extract the highest quality image URL from an image detail page"""
+        detail_url = f"{self.base_url}/images/{image_id}"
+        
+        try:
+            response = self.get_with_retry(detail_url)
+            if not response:
+                return None
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Method 1: Look for wp-content/uploads URLs in the HTML
+            # These are typically the full-resolution images
+            wp_content_urls = []
+            
+            # Search in all links and image sources
+            for element in soup.find_all(['a', 'img']):
+                for attr in ['href', 'src', 'data-src']:
+                    url = element.get(attr)
+                    if url and '/wp-content/uploads/' in url and url.endswith(('.jpg', '.jpeg', '.png')):
+                        full_url = urljoin(self.base_url, url)
+                        wp_content_urls.append(full_url)
+            
+            # Also search in the raw HTML text for any wp-content URLs
+            html_text = str(soup)
+            wp_content_matches = re.findall(r'https?://[^"\s]*?/wp-content/uploads/[^"\s]*?\.(?:jpg|jpeg|png)', html_text, re.IGNORECASE)
+            wp_content_urls.extend(wp_content_matches)
+            
+            # Remove duplicates and filter
+            wp_content_urls = list(set(wp_content_urls))
+            
+            if wp_content_urls:
+                # If multiple URLs found, prefer the one with highest resolution indicators
+                best_url = None
+                max_score = 0
+                
+                for url in wp_content_urls:
+                    score = 0
+                    url_lower = url.lower()
+                    
+                    # Higher score for larger dimensions mentioned in URL
+                    if '3840' in url or '4k' in url_lower:
+                        score += 1000
+                    elif '2560' in url or '1920' in url:
+                        score += 500
+                    elif '1680' in url or '1440' in url:
+                        score += 300
+                    elif '1366' in url or '1280' in url:
+                        score += 200
+                    
+                    # Prefer URLs without size indicators (often full resolution)
+                    if not any(size in url for size in ['150x150', '300x300', '768x', '1024x']):
+                        score += 100
+                    
+                    # Prefer .jpg over .png for wallpapers (typically smaller file size)
+                    if url_lower.endswith('.jpg') or url_lower.endswith('.jpeg'):
+                        score += 10
+                    
+                    if score > max_score:
+                        max_score = score
+                        best_url = url
+                
+                if best_url:
+                    print(f"Found high-res URL for image {image_id}: {best_url}")
+                    return best_url
+                else:
+                    return wp_content_urls[0]  # Return first if no scoring worked
+            
+            # Method 2: If no wp-content URLs found, look for the largest image
+            print(f"No wp-content URLs found for image {image_id}, trying fallback method...")
+            
+            images = soup.find_all('img')
+            best_image_url = None
+            max_resolution = 0
+            
+            for img in images:
+                src = img.get('src') or img.get('data-src')
+                if not src:
+                    continue
+                
+                # Skip obviously small images, thumbnails, or mobile versions
+                if any(keyword in src.lower() for keyword in ['thumb', 'mobile', 'small', 'icon', '150x', '300x']):
+                    continue
+                
+                # Look for images that are likely the main wallpaper
+                if src.endswith(('.jpg', '.jpeg', '.png')):
+                    full_url = urljoin(self.base_url, src)
+                    
+                    # Try to estimate quality by URL patterns or image dimensions
+                    estimated_quality = 0
+                    if '1920' in src or '2560' in src or '3840' in src:
+                        estimated_quality = 1000
+                    elif 'full' in src.lower() or 'hd' in src.lower():
+                        estimated_quality = 500
+                    elif not any(size in src for size in ['320', '640', '800', '1024']):
+                        estimated_quality = 100
+                    
+                    if estimated_quality > max_resolution:
+                        max_resolution = estimated_quality
+                        best_image_url = full_url
+            
+            return best_image_url
+            
+        except requests.exceptions.RequestException as e:
+            if hasattr(e, 'response') and e.response and e.response.status_code == 404:
+                print(f"Image {image_id} not found (404)")
+            else:
+                print(f"Error fetching image {image_id}: {e}")
+        except Exception as e:
+            print(f"Error processing image {image_id}: {e}")
+        
+        return None
+    
+    def download_image(self, image_url, filename):
+        """Download an image from URL"""
+        try:
+            response = self.get_with_retry(image_url)
+            if not response:
+                return False
+            
+            filepath = os.path.join(self.download_folder, filename)
+            
+            with open(filepath, 'wb') as f:
+                f.write(response.content)
+            
+            # Get file size for reporting
+            file_size = len(response.content)
+            print(f"Downloaded: {filename} ({file_size/1024/1024:.1f} MB)")
+            return True
+            
+        except Exception as e:
+            print(f"Error downloading {image_url}: {e}")
+            return False
+    
+    def scrape_by_id_range(self, start_id=1, end_id=100):
+        """Scrape images by ID range, finding high-resolution versions"""
+        print(f"Starting to download high-resolution images from ID {start_id} to {end_id}")
+        print(f"Total images to process: {end_id - start_id + 1}")
+        
+        # First check if site is accessible
+        if not self.check_site_accessibility():
+            print("Site appears to be blocking requests. Try:")
+            print("1. Using a VPN")
+            print("2. Running the scraper from a different IP")
+            print("3. Waiting and trying later")
+            return
+        
+        total_downloaded = 0
+        total_skipped = 0
+        total_failed = 0
+        
+        for image_id in range(start_id, end_id + 1):
+            # Progress reporting
+            if image_id % 10 == 0:
+                progress = ((image_id - start_id) / (end_id - start_id + 1)) * 100
+                print(f"\nProgress: {progress:.1f}% (ID {image_id}/{end_id})")
+                print(f"Downloaded: {total_downloaded}, Skipped: {total_skipped}, Failed: {total_failed}")
+            
+            # Check if already downloaded
+            potential_files = [f for f in os.listdir(self.download_folder) 
+                             if f.startswith(f"spotlight_{image_id}_") or f.startswith(f"spotlight_{image_id}.")]
+            
+            if potential_files:
+                print(f"Skipping image {image_id} (already exists)")
+                total_skipped += 1
+                continue
+            
+            print(f"Processing image {image_id}...")
+            
+            # Get the actual high-resolution image URL
+            image_url = self.get_image_url_from_detail_page(image_id)
+            
+            if image_url:
+                # Determine file extension
+                parsed = urlparse(image_url)
+                ext = os.path.splitext(parsed.path)[1] or '.jpg'
+                
+                # Extract filename from URL path for better naming
+                url_filename = os.path.basename(parsed.path)
+                if url_filename and '.' in url_filename:
+                    filename = f"spotlight_{image_id}_{url_filename}"
+                else:
+                    filename = f"spotlight_{image_id}{ext}"
+                
+                # Download the image
+                if self.download_image(image_url, filename):
+                    total_downloaded += 1
+                else:
+                    total_failed += 1
+            else:
+                print(f"Failed to find high-res URL for image {image_id}")
+                total_failed += 1
+            
+            # Be respectful to the server - random delays
+            delay = random.uniform(2, 4)
+            print(f"Waiting {delay:.1f}s before next request...")
+            time.sleep(delay)
+        
+        print(f"\nScraping completed!")
+        print(f"Total downloaded: {total_downloaded}")
+        print(f"Total skipped (already existed): {total_skipped}")
+        print(f"Total failed: {total_failed}")
+
+def main():
+    scraper = WindowsSpotlightScraper()
+    
+    print("Windows Spotlight High-Resolution Image Scraper")
+    print("=" * 50)
+    
+    while True:
+        try:
+            start_id = int(input("Enter start ID (e.g., 1): ").strip())
+            end_id = int(input("Enter end ID (e.g., 50): ").strip())
+            
+            if start_id > end_id:
+                print("Start ID must be less than or equal to end ID!")
+                continue
+                
+            break
+        except ValueError:
+            print("Please enter valid numbers!")
+    
+    print(f"\nStarting download of images {start_id} to {end_id}...")
+    scraper.scrape_by_id_range(start_id, end_id)
+
+if __name__ == "__main__":
+    main()
